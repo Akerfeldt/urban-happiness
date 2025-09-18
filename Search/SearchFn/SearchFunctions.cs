@@ -36,6 +36,12 @@ public class SearchFunctions
         return SearchDb(req);
     }
 
+    [Function("SearchDbLowCpu")]
+    public IActionResult SearchDbLowCpuFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    {
+        return SearchDbLowCpu(req);
+    }
+
     [Function("SeedTable")]
     public async Task<IActionResult> SeedTableFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
@@ -151,6 +157,47 @@ public class SearchFunctions
             parameters.Add("Location", $"%{EscapeSearchTerm(options.Location)}%");
         }
         var results = conn.Query<DbUser>(sb.ToString(), parameters);
+
+        return new OkObjectResult(results);
+    }
+
+    private IActionResult SearchDbLowCpu(HttpRequest req)
+    {
+        var options = GetSearchOptions(req);
+        if (options.IsEmpty)
+        {
+            return new OkObjectResult(new List<UserDto>());
+        }
+
+        var connectionString = _configuration.GetConnectionString("searchdb");
+        var conn = new SqlConnection(connectionString);
+        var users = conn.Query<DbUser>("SELECT * FROM [dbo].[users]") as IList<DbUser>;
+
+        var results = new List<UserDto>();
+        foreach (var user in users)
+        {
+            if (user == null)
+                continue;
+
+            if (results.Count >= 100)
+            {
+                break;
+            }
+
+            if (!string.IsNullOrEmpty(options.Name)
+                && user.Name?.Contains(options.Name) != true)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(options.Location)
+                && user.Location?.Contains(options.Location) != true)
+            {
+                continue;
+            }
+
+            results.Add(new UserDto(user));
+        }
 
         return new OkObjectResult(results);
     }
