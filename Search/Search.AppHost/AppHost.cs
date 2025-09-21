@@ -7,7 +7,7 @@ var storage = builder.AddAzureStorage("storage")
                          azurite.WithDataVolume();
                      });
 
-var tables = storage.AddTables("tables");
+var blobs = storage.AddBlobs("blobs");
 
 var sql = builder.AddSqlServer("sql")
                  .WithDataVolume();
@@ -38,7 +38,7 @@ var db = sql.AddDatabase(databaseName)
 
 builder.AddAzureFunctionsProject<Projects.SearchFn>("searchfn")
        .WithHostStorage(storage)
-       .WithReference(tables)
+       .WithReference(blobs)
        .WithReference(db);
 
 builder.Build().Run();

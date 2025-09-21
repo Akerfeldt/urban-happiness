@@ -1,9 +1,10 @@
 using System.Data;
 using System.Text;
 using Azure;
-using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using Bogus;
 using Dapper;
+using MessagePack;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
@@ -24,10 +25,22 @@ public class SearchFunctions
         _configuration = configuration;
     }
 
-    [Function("SearchTable")]
-    public IActionResult SearchTableFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    [Function("CountDb")]
+    public IActionResult CountDbFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
-        return SearchTable(req);
+        return CountDb();
+    }
+
+    [Function("CountBlob")]
+    public IActionResult CountBlobFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    {
+        return CountBlob();
+    }
+
+    [Function("SearchBlob")]
+    public IActionResult SearchBlobFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    {
+        return SearchBlob(req);
     }
 
     [Function("SearchDb")]
@@ -42,41 +55,45 @@ public class SearchFunctions
         return SearchDbLowCpu(req);
     }
 
-    [Function("SeedTable")]
-    public async Task<IActionResult> SeedTableFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    [Function("SeedBlob")]
+    public async Task<IActionResult> SeedBlobFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
-        var tableClient = GetTableClient();
-        await tableClient.CreateIfNotExistsAsync();
+        var blobClient = GetBlobClient();
+        var blobUsers = GetBlobUsers(blobClient);
 
-        var userFaker = new Faker<TableUser>()
+        var userFaker = new Faker<BlobUser>()
                 .RuleFor(u => u.Id, f => f.Random.Int(min: 0))
                 .RuleFor(u => u.DateOfBirth, f => f.Date.Past(50, DateTime.UtcNow.AddYears(-18)).ToString("yyyy-MM-dd"))
                 .RuleFor(u => u.Email, (f, u) => f.Internet.Email(u.Name))
                 .RuleFor(u => u.Location, f => f.Address.Country())
                 .RuleFor(u => u.Name, f => f.Name.FullName())
                 .RuleFor(u => u.Reputation, f => f.Random.Int(min: 0));
+        var newUsers = userFaker.Generate(1000);
+        blobUsers.AddRange(newUsers);
 
-        for (int i = 0; i < 10; i++)
-        {
-            var newUsers = userFaker.Generate(100);
-            var actions = new List<TableTransactionAction>();
-            foreach (var user in newUsers)
-            {
-                var action = new TableTransactionAction(TableTransactionActionType.Add, user);
-                actions.Add(action);
-            }
-            tableClient.SubmitTransaction(actions);
-        }
+        var newBlobBytes = MessagePackSerializer.Serialize(blobUsers);
+        blobClient.Upload(new MemoryStream(newBlobBytes), overwrite: true);
 
         return new OkObjectResult("");
+    }
+
+    private static List<BlobUser> GetBlobUsers(BlobClient blobClient)
+    {
+        try
+        {
+            var blobBytes = blobClient.DownloadContent().Value.Content.ToArray();
+            var blobUsers = MessagePackSerializer.Deserialize<List<BlobUser>>(blobBytes);
+            return blobUsers;
+        }
+        catch (RequestFailedException ex) when (ex.Status == 404)
+        {
+            return [];
+        }
     }
 
     [Function("SeedDb")]
     public async Task<IActionResult> SeedDbFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
-        var tableClient = GetTableClient();
-        await tableClient.CreateIfNotExistsAsync();
-
         var userFaker = new Faker<DbUser>()
                 .RuleFor(u => u.DateOfBirth, f => f.Date.Past(50, DateTime.UtcNow.AddYears(-18)))
                 .RuleFor(u => u.Email, (f, u) => f.Internet.Email(u.Name))
@@ -97,9 +114,7 @@ public class SearchFunctions
             usersDataTable.Rows.Add(user.DateOfBirth, user.Email, user.Location, user.Name, user.Reputation);
         }
 
-        var connectionString = _configuration.GetConnectionString("searchdb");
-        var conn = new SqlConnection(connectionString);
-        using (SqlConnection connection = new(connectionString))
+        using (SqlConnection connection = new(GetDbConnectionString()))
         {
             connection.Open();
             try
@@ -122,11 +137,32 @@ public class SearchFunctions
         return new OkObjectResult("");
     }
 
-    private TableClient GetTableClient()
+    private IActionResult CountDb()
     {
-        var connectionString = GetTableConnectionString();
-        var tableClient = new TableClient(connectionString, "users");
-        return tableClient;
+        var conn = new SqlConnection(GetDbConnectionString());
+        var rowCount = conn.ExecuteScalar<int>("SELECT COUNT(*) FROM [dbo].[users]");
+
+        return new OkObjectResult(rowCount);
+    }
+
+    private IActionResult CountBlob()
+    {
+        var blobClient = GetBlobClient();
+        var blobUsers = GetBlobUsers(blobClient);
+        return new OkObjectResult(blobUsers.Count);
+    }
+
+    private string? GetDbConnectionString()
+    {
+        return _configuration.GetConnectionString("searchdb");
+    }
+
+    private BlobClient GetBlobClient()
+    {
+        var connectionString = GetBlobConnectionString();
+        var containerClient = new BlobContainerClient(connectionString, "users");
+        containerClient.CreateIfNotExists();
+        return containerClient.GetBlobClient("allusers");
     }
 
     private IActionResult SearchDb(HttpRequest req)
@@ -137,12 +173,10 @@ public class SearchFunctions
             return new OkObjectResult(new List<UserDto>());
         }
 
-        var connectionString = _configuration.GetConnectionString("searchdb");
-        var conn = new SqlConnection(connectionString);
+        var conn = new SqlConnection(GetDbConnectionString());
 
         var sb = new StringBuilder();
         sb.Append("SELECT * FROM [dbo].[users] WHERE ");
-
 
         var parameters = new Dictionary<string, object>();
         if (!string.IsNullOrEmpty(options.Name))
@@ -169,12 +203,11 @@ public class SearchFunctions
             return new OkObjectResult(new List<UserDto>());
         }
 
-        var connectionString = _configuration.GetConnectionString("searchdb");
-        var conn = new SqlConnection(connectionString);
+        var conn = new SqlConnection(GetDbConnectionString());
         var users = conn.Query<DbUser>("SELECT * FROM [dbo].[users]") as IList<DbUser>;
 
         var results = new List<UserDto>();
-        foreach (var user in users)
+        foreach (var user in users!)
         {
             if (user == null)
                 continue;
@@ -204,7 +237,7 @@ public class SearchFunctions
 
     private string EscapeSearchTerm(string s) => s.Replace("[", "[[").Replace("%", "[%]");
 
-    private IActionResult SearchTable(HttpRequest req)
+    private IActionResult SearchBlob(HttpRequest req)
     {
         var results = new List<UserDto>();
         var options = GetSearchOptions(req);
@@ -213,9 +246,9 @@ public class SearchFunctions
             return new OkObjectResult(results);
         }
 
-        var tableClient = GetTableClient();
-        Pageable<TableUser> queryResults = tableClient.Query<TableUser>(maxPerPage: 1000);
-        foreach (var entity in queryResults)
+        var blobClient = GetBlobClient();
+        var blobUsers = GetBlobUsers(blobClient);
+        foreach (var entity in blobUsers)
         {
             if (entity == null)
                 continue;
@@ -243,10 +276,10 @@ public class SearchFunctions
         return new OkObjectResult(results);
     }
 
-    private string? GetTableConnectionString()
+    private string? GetBlobConnectionString()
     {
-        return _configuration.GetValue<string>("Aspire:Azure:Data:Tables:tables:ConnectionString")
-            ?? _configuration.GetConnectionString("tables");
+        return _configuration.GetValue<string>("Aspire:Azure:Storage:Blobs:blobs:ConnectionString")
+            ?? _configuration.GetConnectionString("blobs");
     }
 
     private SearchOptions GetSearchOptions(HttpRequest req)
@@ -261,18 +294,26 @@ public class SearchFunctions
         public bool IsEmpty => string.IsNullOrEmpty(Name) && string.IsNullOrEmpty(Location);
     }
 
-    public class TableUser : ITableEntity
+    [MessagePackObject]
+    public class BlobUser
     {
+        [Key(0)]
         public int Id { get; set; }
+
+        [Key(1)]
         public string? DateOfBirth { get; set; }
+
+        [Key(2)]
         public string? Email { get; set; }
+
+        [Key(3)]
         public string? Name { get; set; }
+
+        [Key(4)]
         public string? Location { get; set; }
+
+        [Key(5)]
         public int Reputation { get; set; }
-        public string PartitionKey { get => (Id / 100).ToString(); set => ((Action)(() => { }))(); }
-        public string RowKey { get => Id.ToString(); set => ((Action)(() => { }))(); }
-        public DateTimeOffset? Timestamp { get; set; } = DateTimeOffset.UtcNow;
-        public ETag ETag { get; set; }
     }
 
     public class DbUser
@@ -304,7 +345,7 @@ public class SearchFunctions
             Reputation = source.Reputation;
         }
 
-        public UserDto(TableUser source)
+        public UserDto(BlobUser source)
         {
             Id = source.Id;
             DateOfBirth = source.DateOfBirth == null ? null : DateOnly.ParseExact(source.DateOfBirth, "yyyy-MM-dd");
