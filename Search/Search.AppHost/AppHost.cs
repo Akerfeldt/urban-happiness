@@ -37,6 +37,7 @@ var db = sql.AddDatabase(databaseName)
             .WithCreationScript(creationScript);
 
 builder.AddAzureFunctionsProject<Projects.SearchFn>("searchfn")
+       .WithExternalHttpEndpoints()
        .WithHostStorage(storage)
        .WithReference(blobs)
        .WithReference(db);
