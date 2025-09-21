@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -18,11 +19,13 @@ public class SearchFunctions
 {
     private readonly ILogger<SearchFunctions> _logger;
     private readonly IConfiguration _configuration;
+    private static IMemoryCache _cache;
 
-    public SearchFunctions(ILogger<SearchFunctions> logger, IConfiguration configuration)
+    public SearchFunctions(ILogger<SearchFunctions> logger, IConfiguration configuration, IMemoryCache cache)
     {
         _logger = logger;
         _configuration = configuration;
+        _cache = cache;
     }
 
     [Function("CountDb")]
@@ -40,7 +43,15 @@ public class SearchFunctions
     [Function("SearchBlob")]
     public IActionResult SearchBlobFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
-        return SearchBlob(req);
+        try
+        {
+            return SearchBlob(req);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Search Failed: {ex.Message}");
+            throw;
+        }
     }
 
     [Function("SearchDb")]
@@ -61,6 +72,9 @@ public class SearchFunctions
         var blobClient = GetBlobClient();
         var blobUsers = GetBlobUsers(blobClient);
 
+        if (blobUsers.Count >= 1000000)
+            return new OkObjectResult(blobUsers.Count);
+
         var userFaker = new Faker<BlobUser>()
                 .RuleFor(u => u.Id, f => f.Random.Int(min: 0))
                 .RuleFor(u => u.DateOfBirth, f => f.Date.Past(50, DateTime.UtcNow.AddYears(-18)).ToString("yyyy-MM-dd"))
@@ -68,21 +82,35 @@ public class SearchFunctions
                 .RuleFor(u => u.Location, f => f.Address.Country())
                 .RuleFor(u => u.Name, f => f.Name.FullName())
                 .RuleFor(u => u.Reputation, f => f.Random.Int(min: 0));
-        var newUsers = userFaker.Generate(1000);
+        var newUsers = userFaker.Generate(1000000);
         blobUsers.AddRange(newUsers);
 
         var newBlobBytes = MessagePackSerializer.Serialize(blobUsers);
         blobClient.Upload(new MemoryStream(newBlobBytes), overwrite: true);
 
-        return new OkObjectResult("");
+        return new OkObjectResult(blobUsers.Count);
     }
 
     private static List<BlobUser> GetBlobUsers(BlobClient blobClient)
     {
         try
         {
-            var blobBytes = blobClient.DownloadContent().Value.Content.ToArray();
-            var blobUsers = MessagePackSerializer.Deserialize<List<BlobUser>>(blobBytes);
+            const string cacheKey = "blobUsers";
+            var blobUsers = _cache.Get<List<BlobUser>>(cacheKey);
+            if (blobUsers == null)
+            {
+                lock (_cache)
+                {
+                    blobUsers = _cache.Get<List<BlobUser>>(cacheKey);
+                    if (blobUsers == null)
+                    {
+                        var blobBytes = blobClient.DownloadContent().Value.Content.ToArray();
+                        blobUsers = MessagePackSerializer.Deserialize<List<BlobUser>>(blobBytes);
+                        _cache.Set(cacheKey, blobUsers, TimeSpan.FromMinutes(5));
+                    }
+                }
+            }
+
             return blobUsers;
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
@@ -94,6 +122,12 @@ public class SearchFunctions
     [Function("SeedDb")]
     public async Task<IActionResult> SeedDbFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
+        var rowCount = GetDbRowCount();
+        if (rowCount == 0)
+        {
+            return new OkObjectResult(rowCount);
+        }
+
         var userFaker = new Faker<DbUser>()
                 .RuleFor(u => u.DateOfBirth, f => f.Date.Past(50, DateTime.UtcNow.AddYears(-18)))
                 .RuleFor(u => u.Email, (f, u) => f.Internet.Email(u.Name))
@@ -108,7 +142,7 @@ public class SearchFunctions
         usersDataTable.Columns.Add("Name", typeof(string));
         usersDataTable.Columns.Add("Reputation", typeof(int));
 
-        var newUsers = userFaker.Generate(1000);
+        var newUsers = userFaker.Generate(1000000);
         foreach (var user in newUsers)
         {
             usersDataTable.Rows.Add(user.DateOfBirth, user.Email, user.Location, user.Name, user.Reputation);
@@ -134,15 +168,22 @@ public class SearchFunctions
             }
         }
 
-        return new OkObjectResult("");
+        rowCount = GetDbRowCount();
+        return new OkObjectResult(rowCount);
     }
 
     private IActionResult CountDb()
     {
-        var conn = new SqlConnection(GetDbConnectionString());
-        var rowCount = conn.ExecuteScalar<int>("SELECT COUNT(*) FROM [dbo].[users]");
+        var rowCount = GetDbRowCount();
 
         return new OkObjectResult(rowCount);
+    }
+
+    private int GetDbRowCount()
+    {
+        var conn = new SqlConnection(GetDbConnectionString());
+        var rowCount = conn.ExecuteScalar<int>("SELECT COUNT(*) FROM [dbo].[users]");
+        return rowCount;
     }
 
     private IActionResult CountBlob()
@@ -203,15 +244,10 @@ public class SearchFunctions
             return new OkObjectResult(new List<UserDto>());
         }
 
-        var conn = new SqlConnection(GetDbConnectionString());
-        var users = conn.Query<DbUser>("SELECT * FROM [dbo].[users]") as IList<DbUser>;
-
+        var users = GetDbUsers();
         var results = new List<UserDto>();
-        foreach (var user in users!)
+        foreach (var user in users)
         {
-            if (user == null)
-                continue;
-
             if (results.Count >= 100)
             {
                 break;
@@ -233,6 +269,27 @@ public class SearchFunctions
         }
 
         return new OkObjectResult(results);
+    }
+
+    private IList<DbUser> GetDbUsers()
+    {
+        const string cacheKey = "dbUsers";
+        var dbUsers = _cache.Get<IList<DbUser>>(cacheKey);
+        if (dbUsers == null)
+        {
+            lock (_cache)
+            {
+                dbUsers = _cache.Get<IList<DbUser>>(cacheKey);
+                if (dbUsers == null)
+                {
+                    var conn = new SqlConnection(GetDbConnectionString());
+                    dbUsers = conn.Query<DbUser>("SELECT * FROM [dbo].[users]") as IList<DbUser>;
+                    _cache.Set(cacheKey, dbUsers, TimeSpan.FromMinutes(5));
+                }
+            }
+        }
+
+        return dbUsers;
     }
 
     private string EscapeSearchTerm(string s) => s.Replace("[", "[[").Replace("%", "[%]");
