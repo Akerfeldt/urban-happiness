@@ -60,6 +60,12 @@ public class SearchFunctions
         return SearchDb(req);
     }
 
+    [Function("SearchDbNoCpu")]
+    public IActionResult SearchDbNoCpuFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    {
+        return SearchDbNoCpu(req);
+    }
+
     [Function("SearchDbLowCpu")]
     public IActionResult SearchDbLowCpuFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
     {
@@ -71,9 +77,10 @@ public class SearchFunctions
     {
         var blobClient = GetBlobClient();
         var blobUsers = GetBlobUsers(blobClient);
+        var rowCount = blobUsers.Count;
 
-        if (blobUsers.Count >= 1000000)
-            return new OkObjectResult(blobUsers.Count);
+        if (rowCount >= 1000000)
+            return new OkObjectResult(rowCount);
 
         var userFaker = new Faker<BlobUser>()
                 .RuleFor(u => u.Id, f => f.Random.Int(min: 0))
@@ -82,7 +89,7 @@ public class SearchFunctions
                 .RuleFor(u => u.Location, f => f.Address.Country())
                 .RuleFor(u => u.Name, f => f.Name.FullName())
                 .RuleFor(u => u.Reputation, f => f.Random.Int(min: 0));
-        var newUsers = userFaker.Generate(1000000);
+        var newUsers = userFaker.Generate(1000000 - rowCount);
         blobUsers.AddRange(newUsers);
 
         var newBlobBytes = MessagePackSerializer.Serialize(blobUsers);
@@ -120,10 +127,10 @@ public class SearchFunctions
     }
 
     [Function("SeedDb")]
-    public async Task<IActionResult> SeedDbFunction([HttpTrigger(AuthorizationLevel.Function, "get")] HttpRequest req)
+    public async Task<IActionResult> SeedDbFunction([HttpTrigger(AuthorizationLevel.Anonymous, "get")] HttpRequest req)
     {
         var rowCount = GetDbRowCount();
-        if (rowCount == 0)
+        if (rowCount >= 1000000)
         {
             return new OkObjectResult(rowCount);
         }
@@ -142,7 +149,7 @@ public class SearchFunctions
         usersDataTable.Columns.Add("Name", typeof(string));
         usersDataTable.Columns.Add("Reputation", typeof(int));
 
-        var newUsers = userFaker.Generate(1000000);
+        var newUsers = userFaker.Generate(1000000 - rowCount);
         foreach (var user in newUsers)
         {
             usersDataTable.Rows.Add(user.DateOfBirth, user.Email, user.Location, user.Name, user.Reputation);
@@ -193,11 +200,6 @@ public class SearchFunctions
         return new OkObjectResult(blobUsers.Count);
     }
 
-    private string? GetDbConnectionString()
-    {
-        return _configuration.GetConnectionString("searchdb");
-    }
-
     private BlobClient GetBlobClient()
     {
         var connectionString = GetBlobConnectionString();
@@ -236,7 +238,7 @@ public class SearchFunctions
         return new OkObjectResult(results);
     }
 
-    private IActionResult SearchDbLowCpu(HttpRequest req)
+    private IActionResult SearchDbNoCpu(HttpRequest req)
     {
         var options = GetSearchOptions(req);
         if (options.IsEmpty)
@@ -269,6 +271,49 @@ public class SearchFunctions
         }
 
         return new OkObjectResult(results);
+    }
+
+    private IActionResult SearchDbLowCpu(HttpRequest req)
+    {
+        var options = GetSearchOptions(req);
+        if (options.IsEmpty)
+        {
+            return new OkObjectResult(new List<UserDto>());
+        }
+
+        var conn = new SqlConnection(GetDbConnectionString());
+        var parameters = new Dictionary<string, object>();
+        if (!string.IsNullOrEmpty(options.Name))
+        {
+            parameters.Add("Name", $"%{EscapeSearchTerm(options.Name)}%");
+        }
+
+        if (!string.IsNullOrEmpty(options.Location))
+        {
+            parameters.Add("Location", $"%{EscapeSearchTerm(options.Location)}%");
+        }
+
+        if (!string.IsNullOrEmpty(options.Name) && !string.IsNullOrEmpty(options.Location))
+        {
+            var results = conn.Query<DbUser>(@"
+            SELECT TOP 100 * FROM (
+            SELECT * FROM dbo.Name_TrigramSearch(@Name)
+            INTERSECT
+            SELECT * FROM dbo.Location_TrigramSearch(@Location)
+            ) Results", parameters);
+            return new OkObjectResult(results);
+        }
+
+        if (!string.IsNullOrEmpty(options.Name))
+        {
+            var results = conn.Query<DbUser>("SELECT TOP 100 * FROM dbo.Name_TrigramSearch(@Name)", parameters);
+            return new OkObjectResult(results);
+        }
+        else
+        {
+            var results = conn.Query<DbUser>("SELECT TOP 100 * FROM dbo.Location_TrigramSearch(@Location)", parameters);
+            return new OkObjectResult(results);
+        }
     }
 
     private IList<DbUser> GetDbUsers()
@@ -337,6 +382,11 @@ public class SearchFunctions
     {
         return _configuration.GetValue<string>("Aspire:Azure:Storage:Blobs:blobs:ConnectionString")
             ?? _configuration.GetConnectionString("blobs");
+    }
+
+    private string? GetDbConnectionString()
+    {
+        return _configuration.GetConnectionString("searchdb");
     }
 
     private SearchOptions GetSearchOptions(HttpRequest req)
